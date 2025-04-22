@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to deploy an EC2 instance with ALB and DocumentDB in an existing VPC'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'Existing VPC ID'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of at least two subnets for ALB and DocumentDB'
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: 'EC2 Key Pair for SSH access'
+
+Resources:
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: "ami-05fa46471b02db0ce"
+      KeyName: !Ref KeyPairName
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+      UserData: !Base64 |
+        #!/bin/bash
+        # Update and install nginx
+        yum update -y
+        yum install -y nginx
+        
+        # Configure Nginx to listen on ports 80, 90, and 95
+        cat <<EOL > /etc/nginx/conf.d/jaimaxcoin.conf
+        server {
+            listen 80;
+            server_name jaimaxcoin.awsdev.site;
+            location / {
+                root /usr/share/nginx/html;
+                index index.html;
+            }
+        }
+
+        server {
+            listen 90;
+            server_name api.awsdev.site;
+            location / {
+                root /usr/share/nginx/html;
+                index index.html;
+            }
+        }
+
+        server {
+            listen 95;
+            server_name admin.awsdev.site;
+            location / {
+                root /usr/share/nginx/html;
+                index index.html;
+            }
+        }
+        EOL
+        
+        # Create a simple HTML file for each server
+        echo "<html><body><h1>Welcome to Jaimaxcoin Site!</h1></body></html>" > /usr/share/nginx/html/index.html
+
+        # Start Nginx
+        systemctl enable nginx
+        systemctl start nginx
+
+  # Security Groups
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow restricted SSH and HTTP access'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 90
+          ToPort: 90
+          CidrIp: 0.0.0.0/0  # Opening port 90
+        - IpProtocol: tcp
+          FromPort: 95
+          ToPort: 95
+          CidrIp: 0.0.0.0/0  # Opening port 95
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'ALB Security Group'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: 'JaimaxcoinProd'
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: 'JaimaxcoinProd'
+
+  # ALB Listeners
+  HTTPListener80:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref JaimaxcoinTargetGroup
+
+  HTTPListener90:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 90
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref APITargetGroup
+
+  HTTPListener95:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 95
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AdminTargetGroup
+
+  # Target Groups with EC2 Instance as Target
+  AdminTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: "AdminJaimaxcoinProd"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 95
+      TargetType: instance
+      Targets:
+        - Id: !Ref EC2Instance  # Register EC2 instance as a target
+
+  APITargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: "API-jaimax"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 90
+      TargetType: instance
+      Targets:
+        - Id: !Ref EC2Instance  # Register EC2 instance as a target
+
+  JaimaxcoinTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: "jaimaxcoinprod"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      Targets:
+        - Id: !Ref EC2Instance  # Register EC2 instance as a target
+
+  # ALB Listener Rules
+  ALBListenerRules:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPListener80
+      Priority: 1
+      Conditions:
+        - Field: host-header
+          Values:
+            - "admin.awsdev.site"  # Updated subdomain for Admin
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AdminTargetGroup
+
+  ALBListenerRulesAPI:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPListener80
+      Priority: 2
+      Conditions:
+        - Field: host-header
+          Values:
+            - "api.awsdev.site"  # Updated subdomain for API
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref APITargetGroup
+
+  ALBListenerRulesMain:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPListener80
+      Priority: 3
+      Conditions:
+        - Field: host-header
+          Values:
+            - "jaimaxcoin.awsdev.site"  # Updated subdomain for Main
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref JaimaxcoinTargetGroup
+
+  # DocumentDB Cluster
+  DocumentDBCluster:
+    Type: AWS::DocDB::DBCluster
+    Properties:
+      DBClusterIdentifier: 'docdb-cluster'
+      MasterUsername: "adminuser"
+      MasterUserPassword: "securepassword"
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      VpcSecurityGroupIds:
+        - !Ref DocumentDBSecurityGroup
+      DBSubnetGroupName: !Ref DocumentDBSubnetGroup
+      Port: 27017
+      EngineVersion: "4.0"
+
+  # DocumentDB Subnet Group
+  DocumentDBSubnetGroup:
+    Type: AWS::DocDB::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'Subnet group for DocumentDB'
+      SubnetIds: !Ref SubnetIds
+
+  # DocumentDB Security Group
+  DocumentDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for DocumentDB'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  # Route 53 Hosted Zone
+  Route53HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: "awsdev.site"
+      HostedZoneConfig:
+        Comment: "Hosted Zone for awsdev.site"
+
+  # Create Route 53 Record Sets for the subdomains pointing to the ALB
+  Route53RecordAdmin:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Name: "admin.awsdev.site"  # Subdomain for Admin
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
+  Route53RecordAPI:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Name: "api.awsdev.site"  # Subdomain for API
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
+  Route53RecordMain:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Name: "jaimaxcoin.awsdev.site"  # Subdomain for Main
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+
+  # CloudWatch Log Group
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/ec2/alb/docdb"
+      RetentionInDays: 30
+
+Outputs:
+  ALBDNS:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Description: 'DNS Name of the ALB'
+  EC2PublicIP:
+    Value: !GetAtt EC2Instance.PublicIp
+    Description: 'Public IP of the EC2 instance'
+  DocumentDBEndpoint:
+    Value: !GetAtt DocumentDBCluster.Endpoint
+    Description: 'Endpoint of the DocumentDB cluster'
