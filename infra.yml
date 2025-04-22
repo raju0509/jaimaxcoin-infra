@@ -111,7 +111,7 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t3.medium
-      ImageId: ami-05fa46471b02db0ce
+      ImageId: ami-0e449927258d45bc4
       KeyName: my-keypair
       SubnetId: !Ref PublicSubnet1
       SecurityGroupIds:
